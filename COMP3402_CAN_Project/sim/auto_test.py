@@ -1,159 +1,132 @@
-# auto_test.py
-# 自动演示：启动 detector + sender，然后按序运行多个攻击示例，并保存 evidence CSV 到 ../evidence/logs/
+from __future__ import annotations
 
-import os
-import sys
+import argparse
 import time
-import threading
-from datetime import datetime
-import shutil
+from pathlib import Path
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-os.chdir(HERE)
-if HERE not in sys.path:
-    sys.path.insert(0, HERE)
+import can
 
-print('auto_test: working dir', HERE)
+from sim.bus import create_bus
+from sim.config import ExperimentConfig, default_experiment
+from sim.detector import SlidingWindowFreqDetector
+from sim.ecu_nodes import start_ecu_fleet, stop_ecu_fleet
+from sim.injector import flood
+from sim.logger import CsvLogger
 
-import detector
-import sender
-import injector
 
-# Scenario parameters (short demo)
-baseline_sec = 5
-burst_rounds = 2
-burst_interval = 2
-burst_duration = 1
-id_sweep_count = 2
-spoof_count = 10
-fuzz_count = 50
+def run_experiment(cfg: ExperimentConfig) -> dict:
+    """
+    Run baseline -> attack (optional) -> recovery.
+    Returns a small summary dict for report/plotting.
+    """
+    out_csv = cfg.out_dir / f"evidence_log_{cfg.run_tag}_{time.strftime('%Y%m%d_%H%M%S')}.csv"
 
-# replay from previous logs folder if available
-replay_path = os.path.normpath(os.path.join(HERE, '..', 'evidence', 'logs'))
+    bus = create_bus(cfg.bus, allow_real_can=cfg.allow_real_can)
+    logger = CsvLogger(out_csv)
 
-# estimate detector run time: baseline + attacks + small buffer
-detector_run_time = baseline_sec + (burst_rounds * (burst_duration + 0.1)) + 3 + 3
+    detector = SlidingWindowFreqDetector(
+        window_s=cfg.detector.window_s,
+        threshold=cfg.detector.threshold,
+    )
 
-# Start detector (non-daemon so we can join)
-t_det = threading.Thread(target=lambda: detector.main(run_time=detector_run_time))
-# Start sender as daemon
-t_snd = threading.Thread(target=sender.main, daemon=True)
+    ecu_nodes = start_ecu_fleet(bus, cfg.ecus)
 
-print('Starting detector...')
-t_det.start()
-# give detector time to initialize
-time.sleep(0.5)
-print('Starting sender...')
-t_snd.start()
+    # A simple receive loop (polling). For heavier loads you can use can.Notifier.
+    tp0 = time.monotonic()
+    alerts_total = 0
 
-# Baseline
-print(f'Collecting baseline for {baseline_sec} seconds...')
-time.sleep(baseline_sec)
+    def phase_sleep(seconds: float, phase: str) -> None:
+        nonlocal alerts_total
+        end = time.monotonic() + float(seconds)
+        while time.monotonic() < end:
+            msg = bus.recv(timeout=0.05)
+            if msg is None:
+                continue
+            logger.log_frame(msg, phase=phase, direction="rx", source="bus")
+            for alert in detector.observe(msg):
+                alerts_total += 1
+                logger.log_alert(alert, phase=phase)
 
-# 1) Burst Flood
-print(f'Running Burst Flood: {burst_rounds} rounds, {burst_duration}s each')
-try:
-    bbus = injector.make_bus()
-    injector.burst_flood(bbus, arb_id=0x100, burst_interval=burst_interval, burst_duration=burst_duration, hz=200, rounds=burst_rounds)
     try:
-        bbus.shutdown()
-    except Exception:
-        pass
-except Exception as e:
-    print('burst_flood error:', e)
+        # baseline
+        phase_sleep(cfg.baseline_s, phase="baseline")
 
-# small pause
-time.sleep(0.5)
+        # attack
+        if cfg.flood.enabled:
+            # Start flooding synchronously (simple) — if you want concurrent RX, run in another thread.
+            # In this minimal design, we flood first then keep receiving; for better realism,
+            # run flood() in a separate thread while continuously receiving.
+            flood(bus, cfg.flood.arb_id, cfg.flood.duration_s, cfg.flood.rate_hz, cfg.flood.data_byte)
 
-# 2) ID Sweep (small range)
-print('Running ID Sweep 0x100-0x10F')
-try:
-    sbus = injector.make_bus()
-    injector.id_sweep(sbus, start_id=0x100, end_id=0x10F, count_per_id=id_sweep_count, delay=0.005)
-    try:
-        sbus.shutdown()
-    except Exception:
-        pass
-except Exception as e:
-    print('id_sweep error:', e)
+            # collect after-attack frames
+            phase_sleep(1.0, phase="attack_post")
 
-# small pause
-time.sleep(0.5)
+        # recovery
+        phase_sleep(cfg.recovery_s, phase="recovery")
 
-# 3) Spoofing
-print('Running Spoofing on 0x200')
-try:
-    spbus = injector.make_bus()
-    injector.spoofing(spbus, arb_id=0x200, spoof_value=250, count=spoof_count, delay=0.05)
-    try:
-        spbus.shutdown()
-    except Exception:
-        pass
-except Exception as e:
-    print('spoofing error:', e)
-
-# small pause
-time.sleep(0.5)
-
-# 4) Fuzzing
-print('Running Fuzzing on 0x300')
-try:
-    fbus = injector.make_bus()
-    injector.fuzzing(fbus, arb_id=0x300, base_payload=[1] * 8, count=fuzz_count, mutation_rate=0.3, delay=0.01)
-    try:
-        fbus.shutdown()
-    except Exception:
-        pass
-except Exception as e:
-    print('fuzzing error:', e)
-
-# small pause
-time.sleep(0.5)
-
-# 5) Replay (if previous evidence exists)
-prev_logs = []
-if os.path.isdir(replay_path):
-    for fn in os.listdir(replay_path):
-        if fn.endswith('.csv'):
-            prev_logs.append(os.path.join(replay_path, fn))
-    prev_logs.sort()
-if prev_logs:
-    last = prev_logs[-1]
-    print('Replaying from', last)
-    try:
-        rbus = injector.make_bus()
-        injector.replay(rbus, last)
+    finally:
+        stop_ecu_fleet(ecu_nodes)
+        logger.close()
         try:
-            rbus.shutdown()
+            bus.shutdown()
         except Exception:
             pass
-    except Exception as e:
-        print('replay error:', e)
-else:
-    print('No previous logs to replay in', replay_path)
 
-# Wait for detector to finish
-print('Waiting for detector to finish...')
-# join with timeout slightly larger than detector_run_time
-t_det.join(timeout=detector_run_time + 2)
+    return {
+        "out_csv": str(out_csv),
+        "alerts_total": alerts_total,
+        "runtime_s": round(time.monotonic() - tp0, 3),
+        "window_s": cfg.detector.window_s,
+        "threshold": cfg.detector.threshold,
+    }
 
-# move evidence_log.csv to evidence/logs with timestamp
-src = os.path.join(HERE, 'evidence_log.csv')
-if os.path.exists(src):
-    dst_dir = os.path.normpath(os.path.join(HERE, '..', 'evidence', 'logs'))
-    os.makedirs(dst_dir, exist_ok=True)
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    dst = os.path.join(dst_dir, f'evidence_log_demo_{ts}.csv')
-    try:
-        try:
-            os.replace(src, dst)
-        except Exception:
-            shutil.copy(src, dst)
-            os.remove(src)
-        print('Moved evidence to', dst)
-    except Exception as e:
-        print('Failed to move evidence file:', e)
-else:
-    print('No evidence_log.csv found in', HERE)
 
-print('auto_test completed.')
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--channel", default="vcan0")
+    p.add_argument("--interface", default="socketcan")
+    p.add_argument("--baseline-s", type=float, default=8.0)
+    p.add_argument("--recovery-s", type=float, default=5.0)
+    p.add_argument("--window-s", type=float, default=2.0)
+    p.add_argument("--threshold", type=int, default=80)
+    p.add_argument("--flood", action="store_true")
+    p.add_argument("--flood-id", default="0x100")
+    p.add_argument("--flood-rate-hz", type=int, default=200)
+    p.add_argument("--flood-duration-s", type=float, default=5.0)
+    p.add_argument("--run-tag", default="demo")
+    p.add_argument("--allow-real-can", action="store_true")
+    args = p.parse_args(argv)
+
+    cfg = default_experiment()
+
+    # override config
+    cfg = ExperimentConfig(
+        bus=cfg.bus.__class__(
+            interface=args.interface,
+            channel=args.channel,
+            bitrate=cfg.bus.bitrate,
+            receive_own_messages=cfg.bus.receive_own_messages,
+        ),
+        ecus=cfg.ecus,
+        detector=cfg.detector.__class__(window_s=args.window_s, threshold=args.threshold),
+        flood=cfg.flood.__class__(
+            enabled=bool(args.flood),
+            arb_id=int(args.flood_id, 16) if str(args.flood_id).startswith("0x") else int(args.flood_id),
+            rate_hz=args.flood_rate_hz,
+            duration_s=args.flood_duration_s,
+            data_byte=0x63,
+        ),
+        baseline_s=args.baseline_s,
+        recovery_s=args.recovery_s,
+        out_dir=cfg.out_dir,
+        run_tag=args.run_tag,
+        allow_real_can=bool(args.allow_real_can),
+    )
+
+    summary = run_experiment(cfg)
+    print("SUMMARY:", summary)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
