@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual env
+.venv/
+venv/
+
+# OS
+.DS_Store
+
+# Logs / outputs (keep if you want "evidence"; otherwise ignore subsets)
+*.log
+
+# Optional: keep only demo logs in git
+# COMP3402_CAN_Project/evidence/logs/*.csv

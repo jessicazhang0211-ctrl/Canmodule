@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import threading
 import time
-from pathlib import Path
-
-import can
 
 from sim.bus import create_bus
 from sim.config import ExperimentConfig, default_experiment
@@ -15,29 +13,19 @@ from sim.logger import CsvLogger
 
 
 def run_experiment(cfg: ExperimentConfig) -> dict:
-    """
-    Run baseline -> attack (optional) -> recovery.
-    Returns a small summary dict for report/plotting.
-    """
     out_csv = cfg.out_dir / f"evidence_log_{cfg.run_tag}_{time.strftime('%Y%m%d_%H%M%S')}.csv"
 
     bus = create_bus(cfg.bus, allow_real_can=cfg.allow_real_can)
     logger = CsvLogger(out_csv)
-
-    detector = SlidingWindowFreqDetector(
-        window_s=cfg.detector.window_s,
-        threshold=cfg.detector.threshold,
-    )
+    detector = SlidingWindowFreqDetector(window_s=cfg.detector.window_s, threshold=cfg.detector.threshold)
 
     ecu_nodes = start_ecu_fleet(bus, cfg.ecus)
 
-    # A simple receive loop (polling). For heavier loads you can use can.Notifier.
-    tp0 = time.monotonic()
     alerts_total = 0
 
-    def phase_sleep(seconds: float, phase: str) -> None:
+    def recv_loop(duration_s: float, phase: str) -> None:
         nonlocal alerts_total
-        end = time.monotonic() + float(seconds)
+        end = time.monotonic() + float(duration_s)
         while time.monotonic() < end:
             msg = bus.recv(timeout=0.05)
             if msg is None:
@@ -49,23 +37,35 @@ def run_experiment(cfg: ExperimentConfig) -> dict:
 
     try:
         # baseline
-        phase_sleep(cfg.baseline_s, phase="baseline")
+        recv_loop(cfg.baseline_s, phase="baseline")
 
-        # attack
+        # attack: run flood concurrently while receiving
         if cfg.flood.enabled:
-            # Start flooding synchronously (simple) — if you want concurrent RX, run in another thread.
-            # In this minimal design, we flood first then keep receiving; for better realism,
-            # run flood() in a separate thread while continuously receiving.
-            flood(bus, cfg.flood.arb_id, cfg.flood.duration_s, cfg.flood.rate_hz, cfg.flood.data_byte)
-
-            # collect after-attack frames
-            phase_sleep(1.0, phase="attack_post")
+            t = threading.Thread(
+                target=flood,
+                kwargs=dict(
+                    bus=bus,
+                    arb_id=cfg.flood.arb_id,
+                    duration_s=cfg.flood.duration_s,
+                    rate_hz=cfg.flood.rate_hz,
+                    data_byte=cfg.flood.data_byte,
+                ),
+                daemon=True,
+            )
+            t.start()
+            recv_loop(cfg.flood.duration_s, phase="attack")
+            t.join(timeout=1.0)
 
         # recovery
-        phase_sleep(cfg.recovery_s, phase="recovery")
+        recv_loop(cfg.recovery_s, phase="recovery")
 
     finally:
         stop_ecu_fleet(ecu_nodes)
+        # optional safety flush
+        try:
+            logger._f.flush()
+        except Exception:
+            pass
         logger.close()
         try:
             bus.shutdown()
@@ -75,9 +75,13 @@ def run_experiment(cfg: ExperimentConfig) -> dict:
     return {
         "out_csv": str(out_csv),
         "alerts_total": alerts_total,
-        "runtime_s": round(time.monotonic() - tp0, 3),
         "window_s": cfg.detector.window_s,
         "threshold": cfg.detector.threshold,
+        "baseline_s": cfg.baseline_s,
+        "recovery_s": cfg.recovery_s,
+        "flood_enabled": cfg.flood.enabled,
+        "flood_rate_hz": cfg.flood.rate_hz,
+        "flood_duration_s": cfg.flood.duration_s,
     }
 
 
@@ -99,7 +103,6 @@ def main(argv=None) -> int:
 
     cfg = default_experiment()
 
-    # override config
     cfg = ExperimentConfig(
         bus=cfg.bus.__class__(
             interface=args.interface,
